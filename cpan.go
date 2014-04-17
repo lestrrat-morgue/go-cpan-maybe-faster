@@ -32,18 +32,38 @@ type Request struct {
 type Client struct {
   Queue chan *Request
   Dependencies map[string]*sync.WaitGroup
+  DistributionNames map[string]string
+  WorkDir string
 }
 
 func NewClient() *Client {
+  tmpdir, err := ioutil.TempDir("", "go-cpan-")
+  if err != nil {
+    panic(err.Error())
+  }
+
   c := &Client {
     make(chan *Request, 1),
     make(map[string]*sync.WaitGroup),
+    make(map[string]string),
+    tmpdir,
   }
   go c.ProcessQueue()
   return c
 }
 
 func (c *Client) Install(d *Dependency) error {
+  wd, err := os.Getwd()
+  if err != nil {
+    return err
+  }
+
+  err = os.Chdir(c.WorkDir)
+  if err != nil {
+    return err
+  }
+  defer os.Chdir(wd)
+
   wg := &sync.WaitGroup {}
   wg.Add(1)
   c.install(d, wg)
@@ -62,6 +82,7 @@ func (c *Client) install(d *Dependency, wg *sync.WaitGroup) {
 
 func (c *Client) ProcessQueue() {
   for r := range c.Queue {
+fmt.Printf("---> r.Name = %s\n", r.Name)
     if r.Name == "perl" {
       fmt.Fprintf(os.Stderr, "%s is not supported, skipping\n", r.Name)
       r.Wait.Done()
@@ -85,7 +106,12 @@ func (c *Client) ProcessDependency(r *Request) {
     return
   }
 
-  c.Fetch(name)
+  if strings.Index(name, "/perl-5.") > -1 {
+    // skip perl
+    c.Dependencies[r.Name].Done()
+    return
+  }
+
 
   d := NewDistribution(name)
   if err = d.Install(c); err != nil {
@@ -98,10 +124,18 @@ func (c *Client) ProcessDependency(r *Request) {
   c.Dependencies[r.Name].Done()
 }
 
-func (c *Client) Fetch(path string) {
-}
+func (c *Client) ResolveDistributionName(name string) (distfile string, err error) {
+  defer func () {
+    if err == nil {
+      fmt.Printf("cpanmetadb says we can get %s from %s\n", name, distfile)
+    }
+  }()
 
-func (c *Client) ResolveDistributionName(name string) (string, error) {
+  distfile, ok := c.DistributionNames[name]
+  if ok {
+    return
+  }
+
   res, err := http.Get("http://cpanmetadb.plackperl.org/v1.0/package/" + name)
   if err != nil {
     return "", err
@@ -117,7 +151,13 @@ func (c *Client) ResolveDistributionName(name string) (string, error) {
   if err != nil {
     return "", err
   }
-  return result["distfile"], nil
+
+  distfile, ok = result["distfile"]
+  if ! ok {
+    return "", fmt.Errorf("could not find where %s can be found", name)
+  }
+
+  return distfile, nil
 }
 
 type Distribution struct {
@@ -134,21 +174,50 @@ func NewDistribution(path string) *Distribution {
   }
 }
 
-func (d *Distribution) Save(r io.Reader) error {
-  dir := path.Dir(d.Path)
+func (c *Client) Fetch(d *Distribution) error {
+  fullpath := filepath.Join(c.WorkDir, d.Path)
+  _, err := os.Stat(fullpath)
+  if err == nil { // cache found
+    return nil
+  }
+
+  url := "http://cpan.metacpan.org/authors/id/" + d.Path
+  fmt.Printf("Fetching %s...\n", url)
+
+  var rdr io.Reader
+  for i := 0; i < 5; i++ {
+    res, err := http.Get(url)
+    if err != nil {
+      fmt.Fprintf(os.Stderr, "failed to download from %s: %s", url, err)
+      continue
+    }
+    if res.StatusCode != 200 {
+      fmt.Fprintf(os.Stderr, "failed to download from %s: status code = %d", url, res.StatusCode)
+      continue
+    }
+
+    rdr = res.Body
+    break
+  }
+
+  if rdr == nil {
+    return fmt.Errorf("Failed to download from %s", url)
+  }
+
+  dir := path.Dir(fullpath)
   if _, err := os.Stat(dir); err != nil {
     if err = os.MkdirAll(dir, 0777); err != nil {
       return err
     }
   }
 
-  fh, err := os.OpenFile(d.Path, os.O_CREATE|os.O_WRONLY, 0777)
+  fh, err := os.OpenFile(fullpath, os.O_CREATE|os.O_WRONLY, 0777)
   if err != nil {
     return err
   }
   defer fh.Close()
 
-  if _, err = io.Copy(fh, r); err != nil {
+  if _, err = io.Copy(fh, rdr); err != nil {
     return err
   }
 
@@ -156,26 +225,16 @@ func (d *Distribution) Save(r io.Reader) error {
 }
 
 func (d *Distribution) Install(c *Client) error {
-  _, err := os.Stat(d.Path)
-  if err != nil {
-    fmt.Printf("Installing %s...\n", d.Path)
-    res, err := http.Get("http://cpan.metacpan.org/authors/id/" + d.Path)
-    if err != nil {
-      return err
-    }
-
-    d.Save(res.Body)
-    _, err = os.Stat(d.Path)
-    if err != nil {
-      return err
-    }
+  fmt.Printf("Installing %s...\n", d.Path)
+  if err := c.Fetch(d); err != nil {
+    return err
   }
 
-  if err = d.Unpack(); err != nil {
+  if err := d.Unpack(); err != nil {
     return fmt.Errorf("error during unpack: %s", err)
   }
 
-  if err = d.ParseMeta(); err != nil {
+  if err := d.ParseMeta(); err != nil {
     return err
   }
 
@@ -183,6 +242,7 @@ func (d *Distribution) Install(c *Client) error {
   if br := d.Meta.BuildRequires; br != nil {
     for _, dep := range br.List {
       wg.Add(1)
+fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
       c.install(dep, wg)
     }
   }
@@ -190,6 +250,7 @@ func (d *Distribution) Install(c *Client) error {
   if cr := d.Meta.ConfigureRequires; cr != nil {
     for _, dep := range cr.List {
       wg.Add(1)
+fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
       c.install(dep, wg)
     }
   }
@@ -197,6 +258,7 @@ func (d *Distribution) Install(c *Client) error {
   if r := d.Meta.Requires; r != nil {
     for _, dep := range r.List {
       wg.Add(1)
+fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
       c.install(dep, wg)
     }
   }
