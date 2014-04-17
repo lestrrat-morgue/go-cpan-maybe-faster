@@ -4,7 +4,9 @@ import (
   "archive/tar"
   "compress/gzip"
   "fmt"
+  "log"
   "strings"
+  "time"
 //  "github.com/mattn/go-sqlite3"
   "gopkg.in/yaml.v1"
   "io"
@@ -34,6 +36,10 @@ type Client struct {
   Dependencies map[string]*sync.WaitGroup
   DistributionNames map[string]string
   WorkDir string
+  logger  *log.Logger
+  notest  bool
+  localLib string
+  localLibContained string
 }
 
 func NewClient() *Client {
@@ -47,12 +53,66 @@ func NewClient() *Client {
     make(map[string]*sync.WaitGroup),
     make(map[string]string),
     tmpdir,
+    nil,
+    false,
+    "",
+    "",
   }
   go c.ProcessQueue()
   return c
 }
 
-func (c *Client) Install(d *Dependency) error {
+func (c *Client) Logf(format string, args ...interface {}) {
+  if c.logger == nil {
+    return
+  }
+
+  if len(format) > 0 && format[len(format)-1] != '\n' {
+    format = format + "\n"
+  }
+
+  c.logger.Printf(format, args...)
+}
+
+func (c *Client) SetNotest(b bool) {
+  c.notest = b
+}
+
+func (c *Client) SetLocalLib(l string) {
+  if ! filepath.IsAbs(l) {
+    p, err := filepath.Abs(l)
+    if err != nil {
+      panic(err.Error())
+    }
+    l = p
+  }
+  c.localLib = l
+}
+
+func (c *Client) SetLocalLibContained(l string) {
+  if ! filepath.IsAbs(l) {
+    p, err := filepath.Abs(l)
+    if err != nil {
+      panic(err.Error())
+    }
+    l = p
+  }
+  c.localLibContained = l
+}
+
+func (c *Client) SetVerbose(b bool) {
+  if b && c.logger == nil {
+    c.logger = log.New(os.Stderr, "", log.LstdFlags)
+  } else {
+    c.logger = nil
+  }
+}
+
+func (c *Client) Install(name string) error {
+  return c.InstallDependency(&Dependency { name, "", false, nil })
+}
+
+func (c *Client) InstallDependency(d *Dependency) error {
   wd, err := os.Getwd()
   if err != nil {
     return err
@@ -82,18 +142,17 @@ func (c *Client) install(d *Dependency, wg *sync.WaitGroup) {
 
 func (c *Client) ProcessQueue() {
   for r := range c.Queue {
-fmt.Printf("---> r.Name = %s\n", r.Name)
+    c.Logf("Working on %s", r.Name)
     if r.Name == "perl" {
-      fmt.Fprintf(os.Stderr, "%s is not supported, skipping\n", r.Name)
+      c.Logf("%s is not supported, skipping\n", r.Name)
       r.Wait.Done()
       continue
     }
     if _, ok := c.Dependencies[r.Name]; ok {
-//      fmt.Fprintf(os.Stderr, "%s has already been requested, skipping\n", r.Name)
+      c.Logf("%s has already been requested, skipping\n", r.Name)
       r.Wait.Done()
       continue
     }
-    fmt.Printf("Processing %s\n", r.Name)
     c.Dependencies[r.Name] = r.Wait
     go c.ProcessDependency(r)
   }
@@ -112,22 +171,33 @@ func (c *Client) ProcessDependency(r *Request) {
     return
   }
 
+  done := false
+  go func() {
+    t := time.Tick(5 * time.Second)
+    for _ = range t {
+      if done {
+        break
+      }
+      c.Logf("Still waiting for %s...", name)
+    }
+  }()
+  defer func() { done = true }()
 
   d := NewDistribution(name)
   if err = d.Install(c); err != nil {
-    fmt.Printf("failed to install %s: %s\n", name, err)
+    c.Logf("failed to install %s: %s\n", name, err)
   } else {
     r.Success = true
   }
 
-  fmt.Printf("DONE: %s\n", name)
+  c.Logf("DONE: %s\n", name)
   c.Dependencies[r.Name].Done()
 }
 
 func (c *Client) ResolveDistributionName(name string) (distfile string, err error) {
   defer func () {
     if err == nil {
-      fmt.Printf("cpanmetadb says we can get %s from %s\n", name, distfile)
+      c.Logf("cpanmetadb says we can get %s from %s\n", name, distfile)
     }
   }()
 
@@ -160,6 +230,31 @@ func (c *Client) ResolveDistributionName(name string) (distfile string, err erro
   return distfile, nil
 }
 
+func (c *Client) runCpanm(d *Distribution) {
+  waitch := make(chan struct{})
+  go func() {
+    defer func() { waitch <- struct{}{} }()
+    cmdlist := []string {}
+    if c.notest {
+      cmdlist = append(cmdlist, "--notest")
+    }
+    if c.localLib != "" {
+      cmdlist = append(cmdlist, "--local-lib", c.localLib)
+    }
+    if c.localLibContained != "" {
+      cmdlist = append(cmdlist, "--local-lib-contained", c.localLibContained)
+    }
+    cmdlist = append(cmdlist, d.WorkDir)
+
+    cmd := exec.Command("cpanm", cmdlist...)
+
+    c.Logf("%v", cmd.Args)
+    output, _ := cmd.CombinedOutput()
+    os.Stdout.Write(output)
+  }();
+  <-waitch
+}
+
 type Distribution struct {
   Path    string
   WorkDir string
@@ -182,17 +277,17 @@ func (c *Client) Fetch(d *Distribution) error {
   }
 
   url := "http://cpan.metacpan.org/authors/id/" + d.Path
-  fmt.Printf("Fetching %s...\n", url)
+  c.Logf("Fetching %s...\n", url)
 
   var rdr io.Reader
   for i := 0; i < 5; i++ {
     res, err := http.Get(url)
     if err != nil {
-      fmt.Fprintf(os.Stderr, "failed to download from %s: %s", url, err)
+      c.Logf("failed to download from %s: %s", url, err)
       continue
     }
     if res.StatusCode != 200 {
-      fmt.Fprintf(os.Stderr, "failed to download from %s: status code = %d", url, res.StatusCode)
+      c.Logf("failed to download from %s: status code = %d", url, res.StatusCode)
       continue
     }
 
@@ -225,7 +320,7 @@ func (c *Client) Fetch(d *Distribution) error {
 }
 
 func (d *Distribution) Install(c *Client) error {
-  fmt.Printf("Installing %s...\n", d.Path)
+  c.Logf("Installing %s...\n", d.Path)
   if err := c.Fetch(d); err != nil {
     return err
   }
@@ -242,7 +337,6 @@ func (d *Distribution) Install(c *Client) error {
   if br := d.Meta.BuildRequires; br != nil {
     for _, dep := range br.List {
       wg.Add(1)
-fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
       c.install(dep, wg)
     }
   }
@@ -250,7 +344,6 @@ fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
   if cr := d.Meta.ConfigureRequires; cr != nil {
     for _, dep := range cr.List {
       wg.Add(1)
-fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
       c.install(dep, wg)
     }
   }
@@ -258,27 +351,16 @@ fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
   if r := d.Meta.Requires; r != nil {
     for _, dep := range r.List {
       wg.Add(1)
-fmt.Printf("%s depends on %s\n", d.Path, dep.Name)
       c.install(dep, wg)
     }
   }
   wg.Wait()
 
-  waitch := make(chan struct{})
-  go func() {
-    defer func() { waitch <- struct{}{} }()
-    fmt.Printf("CMD: cpanm %s\n", d.WorkDir)
-    cmd := exec.Command("cpanm", "-n", "-L", "local", d.WorkDir)
-    output, _ := cmd.CombinedOutput()
-    os.Stdout.Write(output)
-  }();
-  <-waitch
-
+  c.runCpanm(d)
   return nil
 }
 
 func (d *Distribution) Unpack()  error {
-  fmt.Printf("Unpacking %s\n", d.Path)
   done := false
   root := ""
   defer func() {
@@ -339,7 +421,6 @@ func (d *Distribution) Unpack()  error {
     }
   }
 
-fmt.Printf("Unpack -> root = %s\n", root)
   done = true
   abspath, err := filepath.Abs(root)
   if err != nil {
