@@ -19,7 +19,7 @@ func main() {
   c.SetLocalLibContained(*localLibContained)
 
   args := flag.Args()
-  if len(args) > 0 {
-    c.Install(args[0])
+  for i := 0; i < len(args); i++ {
+    c.Install(args[i])
   }
 }
