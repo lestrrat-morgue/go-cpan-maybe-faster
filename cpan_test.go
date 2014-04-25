@@ -1,10 +1,10 @@
 package cpan
 
 import (
-  "testing"
+	"testing"
 )
 
 func TestClient(t *testing.T) {
-  client := NewClient()
-  client.Install(&Dependency{ "Moose", "", false, nil })
+	client := NewClient()
+	client.Install(&Dependency{"Moose", "", false, nil})
 }
